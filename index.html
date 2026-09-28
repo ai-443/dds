@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Pair Stress Panel — Multi-Server</title>
+<title>Pair Stress Panel — MongoDB Edition</title>
 <style>
   :root {
     --bg:#0b0f17; --card:#121a29; --line:#22304a; --txt:#e6edf7; --dim:#8fa3bf;
@@ -36,6 +36,7 @@
   button.ghost { background:transparent; color:var(--acc); border:1px solid var(--line); }
   button.danger { background:var(--err); color:#fff; }
   button.ok { background:var(--ok); color:#06210f; }
+  button.tiny { padding:4px 10px; font-size:11px; margin:0 2px; }
   .stats { display:flex; gap:10px; flex-wrap:wrap; margin:10px 0; }
   .stat { background:#0d1522; border:1px solid var(--line); border-radius:10px; padding:10px 16px; min-width:110px; }
   .stat .n { font-size:22px; font-weight:700; }
@@ -44,6 +45,8 @@
   .stat.blue .n { color:var(--acc); } .stat.yellow .n { color:var(--warn); }
   .badge { display:inline-block; background:var(--warn); color:#231a00; border-radius:6px;
     padding:2px 8px; font-size:11px; font-weight:700; margin-left:8px; vertical-align:middle; }
+  .badge.db { background:var(--ok); color:#06210f; }
+  .badge.nodb { background:var(--err); color:#fff; }
   table { width:100%; border-collapse:collapse; font-size:12px; margin-top:8px; }
   th, td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); }
   th { color:var(--dim); text-transform:uppercase; font-size:11px; letter-spacing:.5px; }
@@ -55,13 +58,22 @@
   #log .ok { color:var(--ok); } #log .err { color:var(--err); }
   #log .warn { color:var(--warn); } #log .info { color:var(--acc); }
   .muted { color:var(--dim); font-size:13px; }
+  .saved-item { background:#0d1522; border:1px solid var(--line); border-radius:8px;
+    padding:8px 12px; margin:6px 0; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; }
+  .saved-item .info { font-size:13px; flex:1; min-width:200px; }
+  .saved-item .info b { color:var(--acc); }
+  .saved-item .info small { color:var(--dim); display:block; margin-top:2px; }
+  .saved-item .actions { display:flex; gap:4px; }
+  .saved-item.editing { border-color:var(--warn); }
+  .saved-item.editing input { margin:0; font-size:12px; padding:6px 8px; }
+  .empty { color:var(--dim); font-size:13px; text-align:center; padding:16px; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
-    <h1>Pair <span>Stress</span> Panel</h1>
-    <p class="sub">Multi-server unlimited pairing-code generator &nbsp;·&nbsp; <span class="muted">No database — nothing is saved. Runs until you press STOP.</span></p>
+    <h1>Pair <span>Stress</span> Panel <span class="badge db" id="dbBadge">MongoDB</span></h1>
+    <p class="sub">Multi-server unlimited pairing-code generator · <span class="muted">Auto-saves to MongoDB. Runs until you press STOP or DELETE.</span></p>
   </header>
 
   <!-- Step 1: servers -->
@@ -101,6 +113,9 @@
       <input type="number" class="small" id="delayInput" value="0" min="0" />
     </div>
     <div class="row">
+      <label><input type="checkbox" id="unlimitedMode" checked /> Unlimited pair generate (run until deleted/stopped)</label>
+    </div>
+    <div class="row">
       <label>Log level</label>
       <select id="logLevel" style="width:220px;">
         <option value="codes" selected>Codes + errors</option>
@@ -136,6 +151,16 @@
     </table>
   </div>
 
+  <!-- saved test sessions (MongoDB) -->
+  <div class="card">
+    <h2>Saved Sessions <span class="badge" id="sessionCount">0 sessions</span></h2>
+    <p class="muted">Each START creates a saved session in MongoDB. Edit or delete any session below.</p>
+    <button type="button" class="ghost" id="refreshSessions">↻ Refresh sessions</button>
+    <div id="sessionsList" style="margin-top:12px;">
+      <div class="empty">No sessions loaded yet.</div>
+    </div>
+  </div>
+
   <!-- live log -->
   <div class="card">
     <h2>Live log</h2>
@@ -153,7 +178,13 @@ let activeWorkers = 0;
 let numIndex = 0;
 const counters = { total: 0, success: 0, error: 0 };
 let rpsWindow = [];
-const serverStats = {}; // url -> {total, success, error, lastCode, lastMs}
+const serverStats = {};
+
+// ---- MongoDB session tracking ----
+let currentSessionId = null;
+const saveQueue = [];
+let flushTimer = null;
+let dbOnline = false;
 
 function getServers() {
   const list = [];
@@ -205,6 +236,81 @@ function log(msg, type) {
   el.scrollTop = el.scrollHeight;
 }
 
+// ---- MongoDB helpers ----
+async function checkDbHealth() {
+  try {
+    const r = await fetch('/api/sessions?action=health');
+    const j = await r.json();
+    dbOnline = !!j.ok;
+    $('dbBadge').className = 'badge ' + (dbOnline ? 'db' : 'nodb');
+    $('dbBadge').textContent = dbOnline ? 'MongoDB' : 'No DB';
+  } catch (_) {
+    dbOnline = false;
+    $('dbBadge').className = 'badge nodb';
+    $('dbBadge').textContent = 'No DB';
+  }
+}
+
+function queueSave(entry) {
+  saveQueue.push(entry);
+  if (flushTimer) return;
+  flushTimer = setTimeout(flushSaves, 600);
+}
+
+async function flushSaves() {
+  flushTimer = null;
+  if (!saveQueue.length || !currentSessionId) return;
+  const batch = saveQueue.splice(0, saveQueue.length);
+  try {
+    await fetch('/api/sessions?action=save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: currentSessionId, entries: batch })
+    });
+  } catch (e) {
+    saveQueue.unshift(...batch);
+    if (saveQueue.length > 2000) saveQueue.splice(0, saveQueue.length - 2000);
+  }
+}
+
+async function createSession() {
+  try {
+    const r = await fetch('/api/sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        servers: getServers(),
+        numbers: getNumbers(),
+        path: $('pathInput').value.trim(),
+        session: $('sessionInput').value.trim() || 'default',
+        concurrency: parseInt($('concurrency').value) || 1,
+        delay: parseInt($('delayInput').value) || 0,
+        unlimited: $('unlimitedMode').checked
+      })
+    });
+    const j = await r.json();
+    currentSessionId = j._id || j.id || null;
+    if (currentSessionId) log('Session saved to MongoDB: ' + currentSessionId, 'ok');
+    else log('Session could not be saved (DB offline?)', 'warn');
+  } catch (e) {
+    currentSessionId = null;
+    log('MongoDB unavailable — running without persistence', 'warn');
+  }
+}
+
+async function endSession(reason) {
+  if (!currentSessionId) return;
+  if (saveQueue.length) await flushSaves();
+  try {
+    await fetch('/api/sessions', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: currentSessionId, status: 'stopped', reason, endedAt: new Date().toISOString() })
+    });
+  } catch (_) { /* ignore */ }
+  currentSessionId = null;
+}
+
 async function hitServer(server, number) {
   const t0 = performance.now();
   const st = serverStats[server] || (serverStats[server] = { total: 0, success: 0, error: 0, lastCode: '', lastMs: 0 });
@@ -225,6 +331,17 @@ async function hitServer(server, number) {
     st.total++; st.lastMs = ms;
     if (j.status === 'success') { counters.success++; st.success++; st.lastCode = j.code || ''; }
     else { counters.error++; st.error++; st.lastCode = ''; }
+
+    queueSave({
+      server,
+      number,
+      status: j.status,
+      code: j.code || null,
+      ms,
+      raw: (j.raw || j.message || '').slice(0, 500),
+      at: new Date().toISOString()
+    });
+
     const level = $('logLevel').value;
     if (level !== 'off' && (level === 'all' || j.status !== 'success' || j.code)) {
       const code = j.code ? ' code=' + j.code : ' ' + (j.raw || j.status || '').slice(0, 60);
@@ -234,6 +351,15 @@ async function hitServer(server, number) {
   } catch (e) {
     counters.total++; counters.error++; rpsWindow.push(1);
     st.total++; st.error++;
+    queueSave({
+      server,
+      number,
+      status: 'error',
+      code: null,
+      ms: Math.round(performance.now() - t0),
+      raw: e.message,
+      at: new Date().toISOString()
+    });
     log(number + ' → ' + server.replace('https://', '').slice(0, 30) + ' → failed: ' + e.message, 'err');
     return { status: 'error', message: e.message };
   }
@@ -246,18 +372,23 @@ async function worker(id) {
   while (running) {
     const number = nextNumber();
     if (!number) {
-      if ($('loopNumbers').checked || $('randomNumbers').checked) { await sleep(500); continue; }
+      if ($('loopNumbers').checked || $('randomNumbers').checked || $('unlimitedMode').checked) {
+        await sleep(500); continue;
+      }
       break;
     }
     const servers = getServers();
     if (!servers.length) { log('Server list is empty — stopping', 'warn'); break; }
-    // ALL servers in parallel, for this one number — nobody gets skipped
     await Promise.allSettled(servers.map((s) => hitServer(s, number)));
     await sleep(parseInt($('delayInput').value) || 0);
   }
   activeWorkers--;
   paintStats();
-  if (activeWorkers === 0) { running = false; log('All workers stopped', 'info'); }
+  if (activeWorkers === 0) {
+    running = false;
+    log('All workers stopped', 'info');
+    endSession('all workers finished');
+  }
 }
 
 function paintStats() {
@@ -283,24 +414,32 @@ function paintStats() {
 }
 setInterval(paintStats, 700);
 
-$('startBtn').onclick = () => {
+$('startBtn').onclick = async () => {
   if (running) return;
   if (!getServers().length) { log('Paste at least one server URL in step 1', 'warn'); return; }
-  if (!getNumbers().length && !$('randomNumbers').checked) { log('Add at least one number in step 2 (or enable random numbers)', 'warn'); return; }
+  if (!getNumbers().length && !$('randomNumbers').checked && !$('unlimitedMode').checked) {
+    log('Add at least one number in step 2 (or enable random numbers)', 'warn'); return;
+  }
   running = true;
   numIndex = 0;
   $('startBtn').disabled = true;
   $('stopBtn').disabled = false;
+
+  await checkDbHealth();
+  await createSession();
+
   const n = parseInt($('concurrency').value) || 1;
-  log('START → ' + getServers().length + ' servers × unlimited numbers | workers=' + n + ' | delay=' + $('delayInput').value + 'ms', 'info');
+  log('START → ' + getServers().length + ' servers × ' + ($('unlimitedMode').checked ? 'UNLIMITED' : 'limited') +
+      ' numbers | workers=' + n + ' | delay=' + $('delayInput').value + 'ms', 'info');
   for (let i = 1; i <= n; i++) worker(i);
 };
 
-$('stopBtn').onclick = () => {
+$('stopBtn').onclick = async () => {
   running = false;
   $('startBtn').disabled = false;
   $('stopBtn').disabled = true;
   log('Stop signal sent — finishing current requests…', 'warn');
+  await endSession('user pressed STOP');
 };
 
 $('clearLog').onclick = () => { $('log').innerHTML = ''; };
@@ -335,9 +474,95 @@ $('loadServers').onclick = async () => {
   }
 };
 
+// ---- Saved sessions list (MongoDB) ----
+let editingId = null;
+
+async function loadSessions() {
+  const box = $('sessionsList');
+  box.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const r = await fetch('/api/sessions');
+    const j = await r.json();
+    const list = j.sessions || j.data || (Array.isArray(j) ? j : []);
+    $('sessionCount').textContent = list.length + ' sessions';
+    if (!list.length) {
+      box.innerHTML = '<div class="empty">No saved sessions yet. Press START to create one.</div>';
+      return;
+    }
+    box.innerHTML = '';
+    list.forEach((s) => box.appendChild(renderSession(s)));
+  } catch (e) {
+    box.innerHTML = '<div class="empty">Could not load sessions: ' + e.message + '</div>';
+  }
+}
+
+function renderSession(s) {
+  const el = document.createElement('div');
+  el.className = 'saved-item';
+  const id = s._id || s.id;
+  const created = s.createdAt ? new Date(s.createdAt).toLocaleString() : '—';
+  const servers = (s.servers || []).length;
+  const codes = s.codes || 0;
+  const errors = s.errors || 0;
+  const status = s.status || 'running';
+  const unlimited = s.unlimited ? '∞ unlimited' : 'limited';
+
+  if (editingId === id) {
+    el.classList.add('editing');
+    el.innerHTML = `
+      <div class="info" style="flex:1;">
+        <input type="text" id="edit-path-${id}" value="${(s.path||'/pair').replace(/"/g,'&quot;')}" placeholder="path" />
+        <input type="text" id="edit-session-${id}" value="${(s.session||'default').replace(/"/g,'&quot;')}" placeholder="session" />
+      </div>
+      <div class="actions">
+        <button class="tiny ok" data-save="${id}">Save</button>
+        <button class="tiny ghost" data-cancel="${id}">Cancel</button>
+      </div>`;
+    el.querySelector(`[data-save="${id}"]`).onclick = async () => {
+      const path = $(`edit-path-${id}`).value.trim();
+      const session = $(`edit-session-${id}`).value.trim() || 'default';
+      try {
+        await fetch('/api/sessions', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id, path, session })
+        });
+        editingId = null;
+        loadSessions();
+      } catch (e) { alert('Update failed: ' + e.message); }
+    };
+    el.querySelector(`[data-cancel="${id}"]`).onclick = () => { editingId = null; loadSessions(); };
+    return el;
+  }
+
+  el.innerHTML = `
+    <div class="info">
+      <b>${servers} servers</b> · ${unlimited} · status: <b>${status}</b>
+      <small>ID: ${id} · created: ${created} · codes: ${codes} · errors: ${errors}</small>
+    </div>
+    <div class="actions">
+      <button class="tiny ghost" data-edit="${id}">✎ Edit</button>
+      <button class="tiny danger" data-del="${id}">🗑 Delete</button>
+    </div>`;
+  el.querySelector(`[data-edit="${id}"]`).onclick = () => { editingId = id; loadSessions(); };
+  el.querySelector(`[data-del="${id}"]`).onclick = async () => {
+    if (!confirm('Delete session ' + id + '? This cannot be undone.')) return;
+    try {
+      await fetch('/api/sessions?id=' + encodeURIComponent(id), { method: 'DELETE' });
+      log('Session deleted: ' + id, 'warn');
+      loadSessions();
+    } catch (e) { alert('Delete failed: ' + e.message); }
+  };
+  return el;
+}
+
+$('refreshSessions').onclick = loadSessions;
+
 setInterval(() => { $('statRps').textContent = rpsWindow.length; rpsWindow = []; }, 1000);
 
 updateCounts();
+checkDbHealth();
+loadSessions();
 </script>
 </body>
 </html>
