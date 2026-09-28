@@ -2,10 +2,13 @@
   "version": 2,
   "builds": [
     { "src": "api/pair.js", "use": "@vercel/node" },
+    { "src": "api/sessions.js", "use": "@vercel/node" },
+    { "src": "api/mongo.js", "use": "@vercel/node" },
     { "src": "index.html", "use": "@vercel/static" }
   ],
   "routes": [
     { "src": "/api/pair", "dest": "/api/pair.js" },
+    { "src": "/api/sessions", "dest": "/api/sessions.js" },
     { "src": "/(.*)", "dest": "/index.html" }
   ]
 }
