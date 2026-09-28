@@ -3,8 +3,8 @@
 
 const { MongoClient, ObjectId } = require('mongodb');
 
-// ⬇⬇⬇  REPLACE THIS WITH YOUR REAL MONGODB URI  ⬇⬇⬇
-const MONGODB_URI = 'mongodb+srv://YOUR_USER:YOUR_PASSWORD@cluster0.xxxxx.mongodb.net/?retryWrites=true&w=majority';
+// ✅ YOUR MongoDB URI (already inserted)
+const MONGODB_URI = 'mongodb+srv://wobeg25858_db_user:meUtccsHuApHc4Vw@cluster0.oy0ymlq.mongodb.net/?appName=Cluster0';
 const DB_NAME = 'pairStress';
 const COLLECTION = 'sessions';
 
